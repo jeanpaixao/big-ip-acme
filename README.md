@@ -13,7 +13,10 @@ Testado em: **BIG-IP v17.5.x**
 - [Instalação](#instalação)
 - [Setup inicial](#setup-inicial)
 - [Gerenciar domínios pela interface](#gerenciar-domínios-pela-interface)
+- [Renovação agendada (cron)](#renovação-agendada-cron)
 - [Monitoramento automático (Watch)](#monitoramento-automático-watch)
+- [Notificações (Rocket.Chat)](#notificações-rocketchat)
+- [Detecção de drift (BIG-IP fora de sincronia)](#detecção-de-drift-big-ip-fora-de-sincronia)
 - [Renovação manual](#renovação-manual)
 - [Remoção de domínios](#remoção-de-domínios)
 - [Estrutura de arquivos](#estrutura-de-arquivos)
@@ -27,25 +30,31 @@ Testado em: **BIG-IP v17.5.x**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  iCall handler (30s)                                        │
-│       │                                                     │
-│       ▼                                                     │
-│  bigip-acme-watch.sh   ←── detecta mudança nos Data Groups │
-│       │                                                     │
-│       ▼                                                     │
-│  bigip-acme.sh         ←── processa cada Data Group        │
-│       │                                                     │
-│       ├── cleanup: remove objetos de domínios apagados      │
-│       │                                                     │
-│       └── dehydrated ──► Let's Encrypt (HTTP-01)           │
-│                │                                            │
-│                └── bigip-hook.sh                           │
-│                        ├── deploy_challenge: insere token   │
-│                        │   no Data Group acme_challenges    │
-│                        ├── iRule responde ao challenge      │
-│                        └── deploy_cert: instala cert/key,  │
-│                            cria/atualiza perfil SSL,        │
-│                            associa ao VS HTTPS              │
+│  Disparo:                                                    │
+│   • iCall handler diário (03:00) — renovação agendada        │
+│   • iCall handler (30s) — bigip-acme-watch.sh, reage a       │
+│     mudança nos Data Groups                                  │
+│       │                                                      │
+│       ▼                                                      │
+│  bigip-acme.sh         ←── processa cada Data Group          │
+│       │                                                      │
+│       ├── cleanup: remove objetos de domínios apagados       │
+│       │                                                      │
+│       └── dehydrated ──► Let's Encrypt (HTTP-01)             │
+│                │                                             │
+│                └── bigip-hook.sh                             │
+│                        ├── deploy_challenge: insere token     │
+│                        │   no Data Group acme_challenges      │
+│                        ├── iRule responde ao challenge         │
+│                        ├── unchanged_cert: compara o           │
+│                        │   fingerprint do cert local com o     │
+│                        │   que o profile SSL usa no BIG-IP —   │
+│                        │   se divergir, reimplanta mesmo sem   │
+│                        │   reemitir na CA (drift)              │
+│                        ├── deploy_cert: instala cert/key/chain │
+│                        │   versionados, faz cutover do profile │
+│                        │   e só então remove a versão anterior │
+│                        └── notifica sucesso/erro no Rocket.Chat│
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,6 +103,10 @@ chmod +x /shared/acme/bigip-acme-watch.sh
 echo 'ACME_EMAIL=seu@email.com.br' > /shared/acme/.env
 chmod 600 /shared/acme/.env
 ```
+
+> Para notificações no Rocket.Chat, adicione `ROCKETCHAT_WEBHOOK_URL` (e opcionalmente
+> `ROCKETCHAT_CHANNEL`/`ROCKETCHAT_USERNAME`) no mesmo arquivo — veja
+> [Notificações (Rocket.Chat)](#notificações-rocketchat).
 
 ### 4. Ajustar fuso horário e NTP (recomendado)
 
@@ -234,6 +247,44 @@ tmsh list ltm data-group internal /Common/acme_vs_meu_bigip_https
 
 ---
 
+## Renovação agendada (cron)
+
+Cria um **iCall periodic handler** que roda a renovação todos os dias às 03:00 — é o mecanismo recomendado para checar/renovar certificados periodicamente (independente de mudanças nos Data Groups, que é o que o [Watch](#monitoramento-automático-watch) cobre).
+
+Diferente de um crontab tradicional (`crontab -e` ou `/etc/cron.d/`), o handler fica salvo dentro da própria configuração do BIG-IP (`sys config`) — sobrevive a upgrades e reinstalações do TMOS sem precisar ser recriado manualmente.
+
+### Ativar
+
+```bash
+/shared/acme/bigip-acme.sh --setup-cron
+```
+
+### Verificar
+
+```bash
+tmsh list sys icall handler periodic acme_renew_handler
+```
+
+Saída esperada:
+
+```
+sys icall handler periodic acme_renew_handler {
+    first-occurrence 2026-07-21:03:00:00
+    interval 86400
+    script acme_renew_scheduler
+}
+```
+
+### Desativar
+
+```bash
+tmsh delete sys icall handler periodic acme_renew_handler
+tmsh delete sys icall script acme_renew_scheduler
+tmsh save sys config
+```
+
+---
+
 ## Monitoramento automático (Watch)
 
 O watch cria um **iCall handler** que verifica os Data Groups a cada 30 segundos. Quando detecta uma mudança, aciona a renovação automaticamente.
@@ -287,6 +338,61 @@ tmsh delete sys icall handler periodic acme_dg_watch_handler
 tmsh delete sys icall script acme_dg_watcher
 tmsh save sys config
 ```
+
+---
+
+## Notificações (Rocket.Chat)
+
+O `bigip-hook.sh` e o `bigip-acme.sh` mandam mensagens para um canal/grupo do Rocket.Chat via **Incoming Webhook** — sem precisar de código adicional, só configurar.
+
+### O que é notificado
+
+| Evento | Quando |
+|--------|--------|
+| ✅ Certificado emitido e implantado | a cada domínio renovado com sucesso |
+| ⚠️ Reimplantação por drift | quando o BIG-IP estava fora de sincronia com o cert local (veja [Detecção de drift](#detecção-de-drift-big-ip-fora-de-sincronia)) |
+| ❌ Falha na emissão/deploy | challenge inválido, erro da CA, erro de `tmsh`, chave/cert que não combinam |
+| 📋 Resumo da execução | ao final de cada `bigip-acme.sh`, com contagem de OK/erros por domínio |
+
+### Configurar
+
+1. No Rocket.Chat: **Administração → Integrações → Novo → Incoming Webhook**
+   - Canal: o grupo/canal de destino (ex.: `#SRE`) — a conta usada em "Publicar como" precisa ser **membro** desse canal se ele for privado
+   - Publicar como: um usuário já existente (ex.: `rocket.cat`)
+   - Script ativado: **não precisa** — o payload já sai no formato nativo do Rocket.Chat
+   - Salvar e copiar a **Webhook URL** gerada (contém um token — trate como credencial, não commite em lugar nenhum)
+
+2. No BIG-IP, adicione ao `/shared/acme/.env`:
+
+```bash
+ROCKETCHAT_WEBHOOK_URL="https://<seu-rocketchat>/hooks/<id>/<token>"
+ROCKETCHAT_USERNAME="bigip-acme"
+# ROCKETCHAT_CHANNEL="#SRE"   # opcional — só se quiser sobrescrever o canal fixado no webhook
+```
+
+```bash
+chmod 600 /shared/acme/.env
+```
+
+3. Teste isolado antes de depender do cron:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"username":"bigip-acme","attachments":[{"text":"teste bigip-acme","color":"good"}]}' \
+  "$(grep ROCKETCHAT_WEBHOOK_URL /shared/acme/.env | cut -d= -f2- | tr -d '"')"
+```
+
+Se a `ROCKETCHAT_WEBHOOK_URL` não estiver configurada, as notificações são simplesmente ignoradas (nenhum erro) — a integração é opcional.
+
+---
+
+## Detecção de drift (BIG-IP fora de sincronia)
+
+O dehydrated decide se renova um certificado com base **só no arquivo local** (`certs/<dominio>/cert.pem`) — ele não sabe se o BIG-IP realmente recebeu a última versão. Se uma renovação anterior emitiu o certificado na CA mas falhou ao aplicá-lo no BIG-IP (erro de `tmsh`, VS indisponível, etc.), o dehydrated segue achando tudo certo e nunca mais tenta reimplantar sozinho — o BIG-IP fica preso num certificado desatualizado (ou vencido) indefinidamente, sem nenhum alerta.
+
+Para evitar isso, sempre que o dehydrated considera um certificado "ainda válido" (`unchanged_cert`), o hook consulta o **fingerprint SHA-256 do certificado que o profile SSL client está usando de fato no BIG-IP** (`tmsh list sys crypto cert`) e compara com o certificado local. Só reimplanta se houver divergência real — domínios já corretos não são tocados, mesmo que o hook nunca tenha rodado essa checagem antes para eles.
+
+Cada versão de certificado é instalada com nome **versionado** (sufixo `-<timestamp>`) em vez de sobrescrever o objeto em uso pelo profile — o BIG-IP não garante consistência ao sobrescrever key/cert que já estão vinculados a um profile ativo, o que antes causava o erro `key and certificate do not match`. O cutover do profile só troca para a nova versão depois que os objetos novos já foram instalados com sucesso; a versão anterior só é removida depois do `tmsh save sys config` confirmar o cutover.
 
 ---
 
@@ -361,16 +467,16 @@ Em até 30 segundos (ou no intervalo configurado do watch), os objetos serão re
 
 ## Objetos criados no BIG-IP
 
-Para cada domínio `meusite.com.br` certificado:
+Para cada domínio `meusite.com.br` certificado, cada versão instalada usa um nome **versionado** (sufixo = timestamp Unix), para nunca sobrescrever objetos vinculados ao profile ativo:
 
 | Tipo | Nome no BIG-IP |
 |------|----------------|
-| Certificado | `/Common/acme_meusite_com_br.crt` |
-| Chave privada | `/Common/acme_meusite_com_br.key` |
-| Chain | `/Common/acme_meusite_com_br-chain.crt` |
-| Perfil SSL client | `/Common/acme_meusite_com_br_ssl` |
+| Certificado | `/Common/acme_meusite_com_br-<timestamp>.crt` |
+| Chave privada | `/Common/acme_meusite_com_br-<timestamp>.key` |
+| Chain | `/Common/acme_meusite_com_br-<timestamp>-chain.crt` |
+| Perfil SSL client | `/Common/acme_meusite_com_br_ssl` (nome fixo — só o cert/key/chain apontados mudam a cada renovação) |
 
-O perfil SSL é associado automaticamente ao VS HTTPS informado no Data Group (`_vs_https`).
+O perfil SSL é associado automaticamente ao VS HTTPS informado no Data Group (`_vs_https`). A versão anterior do cert/key/chain só é removida depois que o cutover do profile é confirmado (`tmsh save sys config` bem-sucedido) — veja [Detecção de drift](#detecção-de-drift-big-ip-fora-de-sincronia).
 
 **Objetos de infraestrutura** (criados no setup, compartilhados):
 
@@ -379,8 +485,10 @@ O perfil SSL é associado automaticamente ao VS HTTPS informado no Data Group (`
 | Data Group (challenges) | `/Common/acme_challenges` |
 | Data Group (domínios) | `/Common/acme_<vs_https_sanitizado>` |
 | iRule | `/Common/acme_challenge_handler` |
-| iCall script | `acme_dg_watcher` |
-| iCall handler | `acme_dg_watch_handler` |
+| iCall script (watch) | `acme_dg_watcher` |
+| iCall handler (watch) | `acme_dg_watch_handler` |
+| iCall script (cron) | `acme_renew_scheduler` |
+| iCall handler (cron) | `acme_renew_handler` |
 
 ---
 
@@ -401,6 +509,9 @@ O perfil SSL é associado automaticamente ao VS HTTPS informado no Data Group (`
 
 # Ativar watch automático (intervalo em segundos)
 WATCH_INTERVAL=30 /shared/acme/bigip-acme.sh --setup-watch
+
+# Agendar renovação diária às 03:00 (iCall, sobrevive a upgrades)
+/shared/acme/bigip-acme.sh --setup-cron
 ```
 
 ### Domínios (tmsh)
@@ -492,6 +603,23 @@ rm /shared/acme/.dg_state
 
 ```bash
 rm -f /shared/acme/.lock
+```
+
+### Erro `key and certificate do not match` (`01070317`)
+
+Sintoma clássico de sobrescrever um cert/key com o mesmo nome enquanto ele está vinculado a um profile SSL client ativo — o BIG-IP não garante consistência entre os dois objetos nesse cenário. Este projeto já evita isso instalando cada versão com nome versionado e só trocando o profile depois da instalação confirmada (veja [Detecção de drift](#detecção-de-drift-big-ip-fora-de-sincronia)). Se o erro aparecer mesmo assim, confirme que o `bigip-hook.sh` em `/shared/acme/` é a versão atual:
+
+```bash
+grep -c "cert_deploy_drifted\|current_bigip_cert_fingerprint" /shared/acme/bigip-hook.sh
+# deve retornar 2 ou mais — se retornar 0, o hook no BIG-IP está desatualizado
+```
+
+### Erro `The requested virtual server profile ... already exists in partition`
+
+O profile SSL já está associado ao VS, mas a checagem de "já associado" não reconheceu isso (formato de saída do `tmsh` inesperado). Confirme que o `bigip-hook.sh` tem o fix (mesma checagem do item acima); se o erro persistir mesmo com o hook atualizado, rode manualmente para inspecionar a saída:
+
+```bash
+tmsh list ltm virtual /Common/<vs_https> profiles
 ```
 
 ### Certificado não renova (ainda válido)
