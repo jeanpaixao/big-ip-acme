@@ -91,6 +91,7 @@ DATAGROUP_NAME="${OBJECT_PREFIX}_challenges"
 DEHYDRATED_URL="https://raw.githubusercontent.com/dehydrated-io/dehydrated/master/dehydrated"
 DEHYDRATED_CONF="${ACME_DIR}/dehydrated.conf"
 LOCK_FILE="${ACME_DIR}/.lock"
+ACME_RESULTS_FILE="${ACME_DIR}/.run_results.txt"
 
 # Carrega .env se existir (sobrescreve variáveis definidas acima)
 # shellcheck source=/dev/null
@@ -99,6 +100,14 @@ LOCK_FILE="${ACME_DIR}/.lock"
 # Se ACME_EMAIL foi definido no .env, usa ele
 CONTACT_EMAIL="${ACME_EMAIL:-${CONTACT_EMAIL}}"
 
+# Notificações Rocket.Chat (opcional — configure via .env ou variáveis de ambiente)
+#   ROCKETCHAT_WEBHOOK_URL — URL do incoming webhook (vazio = notificações desligadas)
+#   ROCKETCHAT_CHANNEL     — canal/usuário de destino (opcional, usa o padrão do webhook se vazio)
+#   ROCKETCHAT_USERNAME    — nome exibido para as mensagens
+ROCKETCHAT_WEBHOOK_URL="${ROCKETCHAT_WEBHOOK_URL:-}"
+ROCKETCHAT_CHANNEL="${ROCKETCHAT_CHANNEL:-}"
+ROCKETCHAT_USERNAME="${ROCKETCHAT_USERNAME:-bigip-acme}"
+
 # =============================================================================
 # FUNÇÕES AUXILIARES
 # =============================================================================
@@ -106,6 +115,70 @@ CONTACT_EMAIL="${ACME_EMAIL:-${CONTACT_EMAIL}}"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die() { log "ERRO: $*" >&2; exit 1; }
 tmsh_cmd() { "${TMSH}" "$@" 2>&1; }
+
+# =============================================================================
+# Notificação Rocket.Chat via incoming webhook (silenciosa se não configurada)
+# Mesma implementação usada em bigip-hook.sh — usada aqui só para o resumo final.
+# =============================================================================
+json_escape() {
+    local s="${1}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "${s}"
+}
+
+notify_rocketchat() {
+    local message="${1}"
+    local color="${2:-good}"
+
+    [[ -z "${ROCKETCHAT_WEBHOOK_URL}" ]] && return 0
+
+    local esc_msg esc_user channel_field=""
+    esc_msg=$(json_escape "${message}")
+    esc_user=$(json_escape "${ROCKETCHAT_USERNAME}")
+    if [[ -n "${ROCKETCHAT_CHANNEL}" ]]; then
+        channel_field="\"channel\":\"$(json_escape "${ROCKETCHAT_CHANNEL}")\","
+    fi
+
+    local payload="{\"username\":\"${esc_user}\",${channel_field}\"attachments\":[{\"text\":\"${esc_msg}\",\"color\":\"${color}\"}]}"
+
+    curl -fsS -m 10 -X POST -H "Content-Type: application/json" \
+        -d "${payload}" "${ROCKETCHAT_WEBHOOK_URL}" >/dev/null 2>&1 \
+        || log "AVISO: falha ao enviar notificação para o Rocket.Chat."
+}
+
+# Lê o ACME_RESULTS_FILE (preenchido pelo bigip-hook.sh a cada domínio processado)
+# e envia um resumo único da execução para o Rocket.Chat.
+send_run_summary() {
+    [[ -f "${ACME_RESULTS_FILE}" ]] || return 0
+    [[ -z "${ROCKETCHAT_WEBHOOK_URL}" ]] && return 0
+
+    local total=0 ok=0 err=0
+    local -a lines=()
+    while IFS='|' read -r status event domain detail; do
+        [[ -z "${status}" ]] && continue
+        total=$((total + 1))
+        if [[ "${status}" == "OK" ]]; then
+            ok=$((ok + 1))
+        else
+            err=$((err + 1))
+        fi
+        lines+=("${status} [${event}] ${domain}: ${detail}")
+    done < "${ACME_RESULTS_FILE}"
+
+    [[ ${total} -eq 0 ]] && return 0
+
+    local color="good"
+    [[ ${err} -gt 0 ]] && color="danger"
+
+    local summary
+    summary=$(printf '*Resumo da renovação ACME* — %s\nOK: %d | Erros: %d | Total: %d\n\n%s' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${ok}" "${err}" "${total}" \
+        "$(printf '%s\n' "${lines[@]}")")
+
+    notify_rocketchat "${summary}" "${color}"
+}
 
 check_deps() {
     for cmd in curl openssl bash awk; do
@@ -625,6 +698,11 @@ cmd_renew() {
     check_deps
     acquire_lock
 
+    : > "${ACME_RESULTS_FILE}"
+    export ACME_RESULTS_FILE
+    export BIGIP_ACME_DIR="${ACME_DIR}"
+    export ROCKETCHAT_WEBHOOK_URL ROCKETCHAT_CHANNEL ROCKETCHAT_USERNAME
+
     [[ -x "${DEHYDRATED}" ]] || die "dehydrated não encontrado. Execute: ${0} --setup"
 
     # Registrar conta se necessário
@@ -671,6 +749,7 @@ cmd_renew() {
     done
 
     log "=== Renovação concluída ==="
+    send_run_summary
 }
 
 # =============================================================================
