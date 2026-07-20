@@ -15,6 +15,9 @@
 #
 # Opções:
 #   --setup              Configuração inicial (idempotente)
+#   --setup-cron         Agenda a renovação diária às 03:00 via iCall periodic
+#                        handler (sobrevive a upgrades/reboots — fica salvo em
+#                        sys config, diferente de um crontab tradicional)
 #   --vs <nome>          VS HTTP (porta 80) que receberá a iRule de challenge.
 #                        Pode ser repetido para múltiplos VSes.
 #   --vs-https <nome>    VS HTTPS para o qual criar o Data Group de domínios.
@@ -44,8 +47,11 @@
 #   tmsh modify ltm data-group internal /Common/acme_meuvs_http-redirect \
 #       records add { "exemplo.com.br www.exemplo.com.br" { data "" } }
 #
-#   # Renovação via cron (sem argumentos — descobre DGs automaticamente)
-#   0 3 * * 1 /shared/acme/bigip-acme.sh >> /shared/acme/logs/acme.log 2>&1
+#   # Renovação agendada (recomendado): iCall periodic, diário às 03:00
+#   ./bigip-acme.sh --setup-cron
+#
+#   # Alternativa via crontab tradicional (não sobrevive a upgrades do TMOS)
+#   0 3 * * * /shared/acme/bigip-acme.sh >> /shared/acme/logs/acme.log 2>&1
 # =============================================================================
 
 set -euo pipefail
@@ -504,6 +510,81 @@ EOF
 }
 
 # =============================================================================
+# SETUP-CRON — cria iCall handler que roda a renovação diariamente às 03:00
+# (fica salvo em sys config — ao contrário de um crontab tradicional, sobrevive
+# a upgrades/reinstalação do TMOS)
+# =============================================================================
+
+cmd_setup_cron() {
+    log "=== Agendando renovação diária às 03:00 (iCall) ==="
+
+    mkdir -p "${LOG_DIR}"
+
+    local icall_script_name="${OBJECT_PREFIX}_renew_scheduler"
+    local icall_handler_name="${OBJECT_PREFIX}_renew_handler"
+
+    if "${TMSH}" list sys icall script "${icall_script_name}" &>/dev/null 2>&1; then
+        log "iCall script '${icall_script_name}' já existe. Atualizando..."
+        tmsh_cmd delete sys icall script "${icall_script_name}"
+    fi
+
+    local tmp_conf
+    tmp_conf=$(mktemp /var/tmp/acme_renew_icall_XXXXXX.conf)
+    cat > "${tmp_conf}" <<EOF
+sys icall script ${icall_script_name} {
+    definition {
+        catch {
+            exec /bin/bash ${ACME_DIR}/bigip-acme.sh >> ${LOG_DIR}/acme.log 2>&1
+        }
+    }
+}
+EOF
+    tmsh_cmd load sys config merge file "${tmp_conf}"
+    rm -f "${tmp_conf}"
+    log "iCall script '${icall_script_name}' criado."
+
+    if "${TMSH}" list sys icall handler periodic "${icall_handler_name}" &>/dev/null 2>&1; then
+        log "iCall handler '${icall_handler_name}' já existe. Atualizando..."
+        tmsh_cmd delete sys icall handler periodic "${icall_handler_name}"
+    fi
+
+    # Ancora a primeira execução às 03:00 (hoje se ainda não passou, senão
+    # amanhã) — "10#" evita que o bash interprete "0300" como octal.
+    local now_hm first_run
+    now_hm=$((10#$(date +%H%M)))
+    if (( now_hm < 300 )); then
+        first_run=$(date -d "today 03:00" "+%Y-%m-%d:%H:%M:%S")
+    else
+        first_run=$(date -d "tomorrow 03:00" "+%Y-%m-%d:%H:%M:%S")
+    fi
+
+    local tmp_conf2
+    tmp_conf2=$(mktemp /var/tmp/acme_renew_icall_h_XXXXXX.conf)
+    cat > "${tmp_conf2}" <<EOF
+sys icall handler periodic ${icall_handler_name} {
+    interval 86400
+    first-occurrence ${first_run}
+    script ${icall_script_name}
+}
+EOF
+    tmsh_cmd load sys config merge file "${tmp_conf2}"
+    rm -f "${tmp_conf2}"
+
+    tmsh_cmd save sys config
+
+    log "iCall handler '${icall_handler_name}' criado."
+    log "  Próxima execução: ${first_run}, depois a cada 24h."
+    log ""
+    log "Confira o agendamento com:"
+    log "  tmsh list sys icall handler periodic ${icall_handler_name}"
+    log ""
+    log "Para remover:"
+    log "  tmsh delete sys icall handler periodic ${icall_handler_name}"
+    log "  tmsh delete sys icall script ${icall_script_name}"
+    log "  tmsh save sys config"
+}
+
+# =============================================================================
 # LIMPEZA — remove objetos BIG-IP de domínios removidos do Data Group
 # =============================================================================
 
@@ -770,6 +851,7 @@ main() {
         case "${1}" in
             --setup)        cmd="setup"; shift ;;
             --setup-watch)  cmd="setup-watch"; shift ;;
+            --setup-cron)   cmd="setup-cron"; shift ;;
             --vs)           [[ -z "${2:-}" ]] && die "--vs requer argumento"; ARG_VS_LIST+=("${2}"); shift 2 ;;
             --vs=*)         ARG_VS_LIST+=("${1#--vs=}"); shift ;;
             --vs-https)     [[ -z "${2:-}" ]] && die "--vs-https requer argumento"; ARG_HTTPS_VS_LIST+=("${2}"); shift 2 ;;
@@ -785,6 +867,7 @@ main() {
     case "${cmd}" in
         setup)       cmd_setup ;;
         setup-watch) cmd_setup_watch ;;
+        setup-cron)  cmd_setup_cron ;;
         renew)       cmd_renew ;;
     esac
 }
