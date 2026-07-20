@@ -119,31 +119,49 @@ sanitize_name() {
 }
 
 # =============================================================================
-# Marcador do último deploy confirmado com sucesso para o domínio (fingerprint
-# do cert local no momento do deploy). Usado por unchanged_cert() para detectar
-# quando o dehydrated acha que está tudo atualizado mas o BIG-IP não recebeu o
-# último certificado (ex.: deploy anterior falhou depois do cert já emitido).
+# Nome do profile SSL client esperado para um domínio (mesma convenção usada
+# em deploy_cert). Centralizado aqui porque unchanged_cert() também precisa.
 # =============================================================================
-deploy_marker_file() {
+ssl_profile_for_domain() {
     local domain="${1}"
-    echo "${ACME_DIR}/.deployed_$(sanitize_name "${domain}").sha256"
+    local cert_name
+    cert_name="${OBJECT_PREFIX}_$(sanitize_name "${domain}")"
+    echo "/${PARTITION}/${cert_name}_ssl"
+}
+
+# =============================================================================
+# Detecta se o BIG-IP está fora de sincronia com o cert local do dehydrated,
+# consultando o fingerprint do certificado REALMENTE em uso pelo profile
+# (não um marcador local — evita falso-positivo em domínios que já estão
+# corretos e falso-negativo se o marcador ficar desatualizado/for perdido).
+# =============================================================================
+current_bigip_cert_fingerprint() {
+    local ssl_profile="${1}"
+    local cert_obj
+    # "|| true" evita que um tmsh não-zero (profile inexistente) derrube o
+    # script inteiro via set -e/pipefail — ausência do profile é tratada logo
+    # abaixo, não é um erro fatal aqui.
+    cert_obj=$("${TMSH}" list ltm profile client-ssl "${ssl_profile}" cert 2>/dev/null | \
+        awk '$1=="cert"{print $2; exit}' || true)
+    [[ -z "${cert_obj}" ]] && return 1
+
+    "${TMSH}" list sys crypto cert "${cert_obj}" 2>/dev/null | \
+        awk -F'SHA256/' '/fingerprint/{print $2; exit}' | tr -d ' \r\n' || true
 }
 
 cert_deploy_drifted() {
-    local domain="${1}" certfile="${2}"
-    local marker current_hash last_hash
-    marker=$(deploy_marker_file "${domain}")
-    [[ -f "${marker}" ]] || return 0
+    local domain="${1}" certfile="${2}" ssl_profile="${3}"
+    local bigip_fp local_fp
 
-    current_hash=$(openssl x509 -noout -fingerprint -sha256 -in "${certfile}" 2>/dev/null || echo "")
-    last_hash=$(cat "${marker}" 2>/dev/null || echo "")
-    [[ -z "${current_hash}" ]] && return 1
-    [[ "${current_hash}" != "${last_hash}" ]]
-}
+    # "|| true": current_bigip_cert_fingerprint retorna 1 quando não há
+    # profile/cert ainda — isso não pode derrubar o script via set -e aqui.
+    bigip_fp=$(current_bigip_cert_fingerprint "${ssl_profile}" || true)
+    [[ -z "${bigip_fp}" ]] && return 0  # sem profile/cert associado ainda -> força deploy
 
-mark_deploy_success() {
-    local domain="${1}" certfile="${2}"
-    openssl x509 -noout -fingerprint -sha256 -in "${certfile}" 2>/dev/null > "$(deploy_marker_file "${domain}")" || true
+    local_fp=$(openssl x509 -noout -fingerprint -sha256 -in "${certfile}" 2>/dev/null | cut -d= -f2 || true)
+    [[ -z "${local_fp}" ]] && return 1
+
+    [[ "${bigip_fp}" != "${local_fp}" ]]
 }
 
 # =============================================================================
@@ -312,7 +330,6 @@ deploy_cert() {
         tmsh_cmd delete sys crypto cert "${old_chain}" 2>/dev/null || true
     fi
 
-    mark_deploy_success "${domain}" "${certfile}"
     record_result "OK" "${event}" "${domain}" "instalado como versão ${timestamp}"
 
     log "deploy_cert: concluído para '${domain}'."
@@ -331,6 +348,11 @@ deploy_cert() {
 attach_ssl_profile_to_vs() {
     local vs="${1}"
     local profile="${2}"
+    # tmsh costuma omitir o prefixo "/Partição/" ao listar objetos que estão
+    # na partição corrente — comparar pelo caminho completo dá falso negativo
+    # (perfil já associado não é detectado) e o "modify ... profiles add"
+    # seguinte falha com "already exists". Por isso comparamos pelo nome-base.
+    local profile_basename="${profile##*/}"
 
     if ! "${TMSH}" list ltm virtual "${vs}" &>/dev/null 2>&1; then
         log "  AVISO: VS HTTPS '${vs}' não encontrado. Ignorando."
@@ -338,15 +360,25 @@ attach_ssl_profile_to_vs() {
     fi
 
     # Verifica se o perfil já está no VS
-    if "${TMSH}" list ltm virtual "${vs}" profiles 2>/dev/null | grep -qF "${profile}"; then
+    if "${TMSH}" list ltm virtual "${vs}" profiles 2>/dev/null | \
+        grep -qE "(^|/)${profile_basename}([[:space:]]|\{|$)"; then
         log "  Perfil '${profile}' já está no VS '${vs}'."
         return
     fi
 
     log "  Associando perfil '${profile}' ao VS HTTPS '${vs}'..."
     # profiles add suporta o modificador "add" (diferente de "rules")
-    "${TMSH}" -c "modify ltm virtual ${vs} profiles add { ${profile} { context clientside } }"
-    log "  Perfil associado ao VS '${vs}'."
+    local out
+    if out=$("${TMSH}" -c "modify ltm virtual ${vs} profiles add { ${profile} { context clientside } }" 2>&1); then
+        log "  Perfil associado ao VS '${vs}'."
+    elif [[ "${out}" == *"already exists"* ]]; then
+        # Checagem acima não pegou (formato de saída inesperado) mas o
+        # próprio BIG-IP confirma que já está associado — segue sem erro.
+        log "  Perfil '${profile}' já estava no VS '${vs}'."
+    else
+        log "  ERRO ao associar perfil: ${out}"
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -355,9 +387,9 @@ attach_ssl_profile_to_vs() {
 #   renovado. Isso NÃO garante que o BIG-IP tenha o mesmo certificado — se o
 #   deploy_cert de uma renovação anterior falhou depois do cert já ter sido
 #   emitido/gravado localmente, o dehydrated segue achando tudo atualizado e
-#   nunca mais tenta reimplantar sozinho. Por isso comparamos aqui o cert
-#   local com o marcador do último deploy confirmado; se divergir, forçamos
-#   o (re)deploy do cert atual mesmo sem reemitir nada na CA.
+#   nunca mais tenta reimplantar sozinho. Por isso comparamos aqui o fingerprint
+#   do cert que o profile SSL realmente está usando no BIG-IP; só reimplanta
+#   se divergir de verdade — domínios já corretos não são tocados.
 # =============================================================================
 unchanged_cert() {
     local domain="${1}"
@@ -377,8 +409,11 @@ unchanged_cert() {
         cut -d= -f2 || echo "desconhecido")
     log "  Expira em: ${expiry}"
 
-    if cert_deploy_drifted "${domain}" "${certfile}"; then
-        log "  AVISO: sem confirmação de que o BIG-IP recebeu o último certificado de '${domain}'. Reimplantando..."
+    local ssl_profile
+    ssl_profile=$(ssl_profile_for_domain "${domain}")
+
+    if cert_deploy_drifted "${domain}" "${certfile}" "${ssl_profile}"; then
+        log "  AVISO: o certificado em uso no BIG-IP não corresponde ao cert local de '${domain}'. Reimplantando..."
         notify_rocketchat "⚠️ *bigip-acme*: *${domain}* tem certificado local válido, mas sem confirmação de deploy no BIG-IP (provável falha anterior). Reimplantando automaticamente." "warning"
         deploy_cert "${domain}" "${keyfile}" "${certfile}" "${fullchainfile}" "${chainfile}" "${timestamp:-$(date +%s)}" "redeploy_drift"
         return
