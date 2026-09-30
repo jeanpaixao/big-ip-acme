@@ -160,17 +160,17 @@ send_run_summary() {
     [[ -f "${ACME_RESULTS_FILE}" ]] || return 0
     [[ -z "${ROCKETCHAT_WEBHOOK_URL}" ]] && return 0
 
-    local total=0 ok=0 err=0
-    local -a lines=()
-    while IFS='|' read -r status event domain detail; do
+    local total=0 renewed=0 unchanged=0 err=0
+    while IFS='|' read -r status event _; do
         [[ -z "${status}" ]] && continue
         total=$((total + 1))
-        if [[ "${status}" == "OK" ]]; then
-            ok=$((ok + 1))
-        else
+        if [[ "${status}" != "OK" ]]; then
             err=$((err + 1))
+        elif [[ "${event}" == "unchanged_cert" ]]; then
+            unchanged=$((unchanged + 1))
+        else
+            renewed=$((renewed + 1))
         fi
-        lines+=("${status} [${event}] ${domain}: ${detail}")
     done < "${ACME_RESULTS_FILE}"
 
     [[ ${total} -eq 0 ]] && return 0
@@ -179,9 +179,8 @@ send_run_summary() {
     [[ ${err} -gt 0 ]] && color="danger"
 
     local summary
-    summary=$(printf '*Resumo da renovação ACME* — %s\nOK: %d | Erros: %d | Total: %d\n\n%s' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "${ok}" "${err}" "${total}" \
-        "$(printf '%s\n' "${lines[@]}")")
+    summary=$(printf '*Resumo da renovação ACME* — %s\nRenovados: %d | Inalterados: %d | Erros: %d | Total: %d' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${renewed}" "${unchanged}" "${err}" "${total}")
 
     notify_rocketchat "${summary}" "${color}"
 }

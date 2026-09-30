@@ -352,7 +352,7 @@ O `bigip-hook.sh` e o `bigip-acme.sh` mandam mensagens para um canal/grupo do Ro
 | ✅ Certificado emitido e implantado | a cada domínio renovado com sucesso |
 | ⚠️ Reimplantação por drift | quando o BIG-IP estava fora de sincronia com o cert local (veja [Detecção de drift](#detecção-de-drift-big-ip-fora-de-sincronia)) |
 | ❌ Falha na emissão/deploy | challenge inválido, erro da CA, erro de `tmsh`, chave/cert que não combinam |
-| 📋 Resumo da execução | ao final de cada `bigip-acme.sh`, com contagem de OK/erros por domínio |
+| 📋 Resumo da execução | ao final de cada `bigip-acme.sh`, apenas com os totais (renovados, inalterados, erros) |
 
 ### Configurar
 
