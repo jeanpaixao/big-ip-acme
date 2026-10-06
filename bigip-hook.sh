@@ -371,6 +371,7 @@ attach_ssl_profile_to_vs() {
     local out
     if out=$("${TMSH}" -c "modify ltm virtual ${vs} profiles add { ${profile} { context clientside } }" 2>&1); then
         log "  Perfil associado ao VS '${vs}'."
+        SSL_PROFILE_ATTACHED=true
     elif [[ "${out}" == *"already exists"* ]]; then
         # Checagem acima não pegou (formato de saída inesperado) mas o
         # próprio BIG-IP confirma que já está associado — segue sem erro.
@@ -419,6 +420,20 @@ unchanged_cert() {
         return
     fi
 
+    # Cert já correto no BIG-IP, mas um VS HTTPS pode ter sido adicionado ao
+    # _vs_https depois do último deploy — associa o perfil onde estiver faltando.
+    if [[ -n "${BIGIP_HTTPS_VS:-}" ]] && "${TMSH}" list ltm profile client-ssl "${ssl_profile}" &>/dev/null; then
+        SSL_PROFILE_ATTACHED=false
+        local vs
+        for vs in ${BIGIP_HTTPS_VS}; do
+            attach_ssl_profile_to_vs "${vs}" "${ssl_profile}" || true
+        done
+        if ${SSL_PROFILE_ATTACHED}; then
+            log "  Salvando configuração (tmsh save sys config)..."
+            tmsh_cmd save sys config
+        fi
+    fi
+
     record_result "OK" "unchanged_cert" "${domain}" "válido até ${expiry}"
 }
 
@@ -427,8 +442,8 @@ unchanged_cert() {
 # =============================================================================
 invalid_challenge() {
     local domain="${1}"
-    local token="${2}"
-    local response="${3}"
+    local token="${2:-}"
+    local response="${3:-}"
 
     CURRENT_DOMAIN="${domain}"
     CURRENT_HOOK="invalid_challenge"
@@ -444,8 +459,8 @@ Resposta da CA: ${response}" "danger"
 # =============================================================================
 request_failure() {
     local status="${1}"
-    local body="${2}"
-    local chain="${3}"
+    local body="${2:-}"
+    local chain="${3:-}"
 
     CURRENT_DOMAIN="${chain:-desconhecido}"
     CURRENT_HOOK="request_failure"

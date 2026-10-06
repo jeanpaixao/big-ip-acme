@@ -30,6 +30,8 @@
 # Estrutura dos Data Groups de domínios:
 #   Um DG por VS HTTPS, nomeado: acme_<vs_name_sanitizado>
 #   Registro especial:  _vs_https  →  /Common/nome_do_vs_https
+#                       (aceita vários VSes separados por espaço, ex: IPv4 + IPv6:
+#                        "/Common/vs_https /Common/vs_https_v6")
 #   Registros de domínio: chave = "dominio.com [san1 san2 ...]"
 #                         valor = vazio (ou descrição livre)
 #
@@ -306,13 +308,22 @@ setup_vs_irule() {
             return
         fi
         local vs_name="/${PARTITION}/${OBJECT_PREFIX}_challenge_vs"
+        local -a ip_opts=()
+        # IPv6 (mais de um ':' no destino): nome próprio, máscara /128 e origem ::/0
+        if [[ "${ACME_VS_DESTINATION//[^:]/}" == ::* ]]; then
+            vs_name="${vs_name}_v6"
+            ip_opts=(mask ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff source ::/0)
+        fi
         if ! "${TMSH}" list ltm virtual "${vs_name}" &>/dev/null 2>&1; then
             log "Criando VS HTTP dedicado: ${vs_name}"
             tmsh_cmd create ltm virtual "${vs_name}" \
                 destination "${ACME_VS_DESTINATION}" \
+                ${ip_opts[@]+"${ip_opts[@]}"} \
                 ip-protocol tcp \
                 profiles add { http } \
                 rules { "/${PARTITION}/${IRULE_NAME}" }
+        else
+            log "  VS '${vs_name}' já existe."
         fi
     else
         for vs in "${vs_list[@]}"; do
@@ -598,7 +609,7 @@ sanitize_domain_name() {
 # Remove perfil SSL, certificado, chave e chain de um domínio
 cleanup_domain() {
     local domain="${1}"   # domínio primário (primeiro token da linha do DG)
-    local https_vs="${2}" # VS HTTPS associado ao DG
+    local https_vs="${2}" # VS(es) HTTPS associado(s) ao DG, separados por espaço
 
     local cert_name="${OBJECT_PREFIX}_$(sanitize_domain_name "${domain}")"
     local ssl_profile="/${PARTITION}/${cert_name}_ssl"
@@ -608,11 +619,14 @@ cleanup_domain() {
 
     log "  Limpando objetos do domínio '${domain}'..."
 
-    # 1. Desassociar perfil SSL do VS HTTPS (incondicional — ignora erro se já não estava lá)
-    if [[ -n "${https_vs}" ]] && "${TMSH}" list ltm virtual "${https_vs}" &>/dev/null 2>&1; then
-        log "    Removendo perfil '${ssl_profile}' do VS '${https_vs}'..."
-        "${TMSH}" -c "modify ltm virtual ${https_vs} profiles delete { ${ssl_profile} }" 2>/dev/null || true
-    fi
+    # 1. Desassociar perfil SSL dos VSes HTTPS (incondicional — ignora erro se já não estava lá)
+    local vs
+    for vs in ${https_vs}; do
+        if "${TMSH}" list ltm virtual "${vs}" &>/dev/null 2>&1; then
+            log "    Removendo perfil '${ssl_profile}' do VS '${vs}'..."
+            "${TMSH}" -c "modify ltm virtual ${vs} profiles delete { ${ssl_profile} }" 2>/dev/null || true
+        fi
+    done
 
     # 2. Deletar perfil SSL client
     if "${TMSH}" list ltm profile client-ssl "${ssl_profile}" &>/dev/null 2>&1; then
@@ -696,14 +710,18 @@ cleanup_removed_domains() {
 # RENOVAÇÃO — descobre DGs automaticamente, processa um por VS HTTPS
 # =============================================================================
 
-# Lê o valor de um registro específico de um Data Group
+# Lê o valor de um registro específico de um Data Group.
+# Retorna o valor inteiro (pode conter espaços, ex: _vs_https com vários VSes).
 dg_get_record() {
     local dg="${1}" key="${2}"
     "${TMSH}" list ltm data-group internal "${dg}" 2>/dev/null | \
         awk -v k="${key}" '
             $0 ~ k" {" { found=1; next }
             found && /data / {
-                val=$2; gsub(/"/, "", val); print val; found=0
+                val=$0
+                sub(/^[[:space:]]*data[[:space:]]+/, "", val)
+                gsub(/"/, "", val)
+                print val; found=0
             }
         '
 }
